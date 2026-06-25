@@ -1,0 +1,30 @@
+name: build-lib
+
+# Stub build callback for the no-env example. A real project would compile and
+# package the library here. This stub echoes and sleeps so the orchestrate
+# workflow has a build lane to fan out to and read outputs from. This file is
+# hand-written and is not part of the workflow set that cascade produces.
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: Commit SHA being built
+        required: false
+        type: string
+    outputs:
+      artifact:
+        description: Identifier for the built library artifact
+        value: ${{ jobs.build.outputs.artifact }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      artifact: ${{ steps.build.outputs.artifact }}
+    steps:
+      - id: build
+        shell: bash
+        run: |
+          echo "Building library for ${{ inputs.sha }}"
+          sleep 2
+          echo "artifact=lib-${{ inputs.sha }}" >> "$GITHUB_OUTPUT"

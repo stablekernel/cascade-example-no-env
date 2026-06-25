@@ -1,0 +1,348 @@
+name: Scenario Suite
+
+# Bespoke end-to-end validation driver for the no-env example. The no-env
+# (library / CLI) topology declares no environments, so cascade emits no
+# deploy lane: orchestrate goes straight from a trunk merge to a minted RC
+# prerelease, with no per-environment deploy job in the run. This suite
+# exercises that path against the real repository: reset to a clean slate,
+# fire orchestrate by committing under src/, assert the RC draft/prerelease
+# is minted, and assert that no deploy job ran in that orchestrate run. This
+# file is hand-written and is not part of the workflow set that cascade
+# produces.
+
+on:
+  workflow_dispatch:
+    inputs:
+      orchestrate_timeout_minutes:
+        description: 'Max minutes to wait for the orchestrate run to mint an RC'
+        type: string
+        default: '8'
+  schedule:
+    # Daily smoke run at 06:30 UTC.
+    - cron: '30 6 * * *'
+
+permissions:
+  contents: write
+  actions: write
+  pull-requests: write
+
+concurrency:
+  group: scenario-suite
+  cancel-in-progress: false
+
+jobs:
+  scenario:
+    name: No-env orchestrate scenario
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      # Captured before anything is dispatched. The reconcile job enumerates
+      # every run this repo produced at or after this instant and fails if any
+      # is unaccounted for in the ledger. Recorded first so no run the suite
+      # causes can fall outside the window.
+      window-start: ${{ steps.window.outputs.window-start }}
+    env:
+      MANIFEST_FILE: .github/manifest.yaml
+      MANIFEST_KEY: ci
+      TAG_PREFIX: rel-
+      BOT_NAME: 'github-actions[bot]'
+      BOT_EMAIL: 'github-actions[bot]@users.noreply.github.com'
+    steps:
+      # The reconcile window opens here, before the first dispatch or merge.
+      # Every run the suite goes on to cause lands at or after this timestamp,
+      # so the reconcile job sees all of them.
+      - name: Open reconcile window
+        id: window
+        run: |
+          set -euo pipefail
+          WINDOW_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "window-start=$WINDOW_START" >> "$GITHUB_OUTPUT"
+          echo "reconcile window opened at $WINDOW_START"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CASCADE_STATE_TOKEN }}
+
+      - name: Setup CLI
+        uses: stablekernel/cascade/.github/actions/setup-cli@v0.2.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: v0.2.1
+
+      - name: Configure git identity
+        run: |
+          git config user.name "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
+
+      # ------------------------------------------------------------------
+      # Stage 0 - RESET: wipe every release, tag, and state entry so the run
+      # always starts from a clean slate.
+      # ------------------------------------------------------------------
+      - name: Reset to clean slate
+        env:
+          GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Resetting releases, tags, and manifest state..."
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' \
+            | while read -r t; do gh release delete "$t" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true; done
+          git fetch --tags --quiet || true
+          for t in $(git tag -l 'v*' 'rel-*'); do git push origin --delete "$t" 2>/dev/null || true; done
+          cascade reset --state --push
+          # Re-sync the local checkout to whatever reset pushed to trunk.
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --hard "origin/${GITHUB_REF_NAME}"
+          echo "Reset complete."
+
+      # ------------------------------------------------------------------
+      # Stage 1 - FIRE ORCHESTRATE: open a PR with a src/ change, squash-merge
+      # it with the PAT so the merge commit carries a feat: subject, which
+      # matches the orchestrate path filter and triggers a version bump.
+      # ------------------------------------------------------------------
+      - name: Open and merge src-change PR to fire orchestrate
+        id: fire
+        env:
+          GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name  "scenario-suite"
+          git config user.email "scenario-suite@users.noreply.github.com"
+
+          # Unique branch so re-runs never collide.
+          STAMP="$(date -u +%Y%m%d%H%M%S)-${GITHUB_RUN_ID}"
+          BRANCH="scenario/src-${STAMP}"
+          git fetch origin main --quiet
+          git checkout -B "$BRANCH" origin/main
+
+          # Write under src/ to match the orchestrate path filter.
+          mkdir -p src
+          printf 'scenario run %s\n' "$STAMP" > src/scenario.txt
+          git add src/scenario.txt
+
+          # Branch commit message is cosmetic under squash; PR title carries
+          # the conventional type and becomes the trunk commit subject.
+          git commit --no-gpg-sign -m "feat: exercise no-env orchestration ${STAMP}"
+          git push origin "$BRANCH"
+
+          # Open PR and squash-merge with the PAT so the push event is
+          # PAT-authored and orchestrate fires.
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "feat: exercise no-env orchestration ${STAMP}" \
+            --body "Automated scenario run; drives orchestrate on merge."
+          gh pr merge "$BRANCH" --squash --delete-branch
+
+          # Capture the exact merge SHA on trunk - used to key the wait loop.
+          git fetch origin main --quiet
+          MERGE_SHA="$(git rev-parse origin/main)"
+          echo "merge_sha=${MERGE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Squash-merged ${BRANCH} -> main at ${MERGE_SHA}."
+
+      - name: Wait for orchestrate run to complete
+        id: orchestrate_wait
+        env:
+          GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
+          WAIT_MINUTES: ${{ github.event.inputs.orchestrate_timeout_minutes || '8' }}
+        run: |
+          set -euo pipefail
+          MERGE_SHA="${{ steps.fire.outputs.merge_sha }}"
+          MAX_ATTEMPTS=$(( WAIT_MINUTES ))   # one attempt every 60s
+
+          # Locate the orchestrate run triggered by this exact merge commit.
+          RUN_ID=""
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            RUN_ID="$(gh run list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --workflow orchestrate.yaml \
+              --branch main \
+              --json databaseId,headSha,status \
+              --jq ".[] | select(.headSha==\"${MERGE_SHA}\") | .databaseId" \
+              2>/dev/null | head -n1 || true)"
+            if [ -n "$RUN_ID" ]; then
+              echo "Found orchestrate run ${RUN_ID} for ${MERGE_SHA}."
+              break
+            fi
+            echo "attempt ${i}/${MAX_ATTEMPTS}: no orchestrate run for ${MERGE_SHA} yet; waiting..."
+            sleep 60
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No orchestrate run found for merge SHA ${MERGE_SHA} after ${WAIT_MINUTES}m."
+            exit 1
+          fi
+
+          # Surface the resolved run id so the fleet reconcile gate can register
+          # it. Emitted as soon as it is known, before the poll below, so the
+          # ledger captures it even if the conclusion poll later fails it.
+          echo "orchestrate_run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+
+          # Poll the located run to completion.
+          attempt=0
+          while [ "$attempt" -lt "$MAX_ATTEMPTS" ]; do
+            attempt=$(( attempt + 1 ))
+            LINE="$(gh run view "$RUN_ID" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json status,conclusion \
+              --jq '"\(.status) \(.conclusion)"' 2>/dev/null || true)"
+            status="${LINE%% *}"
+            conclusion="${LINE##* }"
+            echo "poll ${attempt}/${MAX_ATTEMPTS}: run ${RUN_ID} status='${status}' conclusion='${conclusion}'"
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "Orchestrate run completed successfully."
+                exit 0
+              fi
+              echo "::error::Orchestrate run ${RUN_ID} completed with conclusion '${conclusion}' (expected success)."
+              exit 1
+            fi
+            sleep 60
+          done
+          echo "::error::Timed out after ${WAIT_MINUTES}m waiting for orchestrate run ${RUN_ID} to complete."
+          exit 1
+
+      # Register the orchestrate run in the fleet ledger so the reconcile gate
+      # accounts for it. Runs whenever the run id resolved, even if the wait
+      # step above failed it, so a registered run is never silently dropped.
+      - name: Register orchestrate run
+        if: always() && steps.orchestrate_wait.outputs.orchestrate_run_id != ''
+        uses: stablekernel/cascade/.github/actions/register-run@main
+        with:
+          run-id: ${{ steps.orchestrate_wait.outputs.orchestrate_run_id }}
+          expected-conclusion: success
+          reason: no-env-direct-prerelease
+          upload: 'true'
+
+      # ------------------------------------------------------------------
+      # Stage 1 assertions: an RC draft/prerelease exists, a matching rel-*-rc.*
+      # tag exists, manifest prerelease state is populated, AND no deploy job
+      # ran in the orchestrate run (the no-env topology emits no deploy lane).
+      # ------------------------------------------------------------------
+      - name: Assert RC draft minted and no deploy ran
+        id: stage1
+        env:
+          GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
+          ORCHESTRATE_RUN_ID: ${{ steps.orchestrate_wait.outputs.orchestrate_run_id }}
+        run: |
+          set -euo pipefail
+
+          # Pull the latest trunk so we read the state the orchestrate run wrote.
+          git fetch origin "${GITHUB_REF_NAME}"
+          git reset --hard "origin/${GITHUB_REF_NAME}"
+
+          # 1) A GitHub release tagged rel-*-rc.* that is a draft or prerelease.
+          RC_RELEASE=""
+          for attempt in 1 2; do
+            RC_RELEASE="$(gh release list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --limit 50 \
+              --json tagName,isDraft,isPrerelease \
+              --jq "[.[] | select(.tagName | test(\"^${TAG_PREFIX}.*-rc\\\\.\")) | select(.isDraft or .isPrerelease)] | .[0].tagName // \"\"" 2>/dev/null || true)"
+            if [ -n "$RC_RELEASE" ]; then
+              break
+            fi
+            echo "RC release not visible yet (attempt ${attempt}); waiting..."
+            sleep 60
+          done
+          if [ -z "$RC_RELEASE" ]; then
+            echo "::error::No draft/prerelease release tagged ${TAG_PREFIX}*-rc.* was found."
+            gh release list --repo "${GITHUB_REPOSITORY}" --limit 50 || true
+            exit 1
+          fi
+          echo "Observed RC release: ${RC_RELEASE}"
+
+          # 2) A matching rel-*-rc.* git tag exists on the remote.
+          RC_GIT_TAG="$(git ls-remote --tags origin \
+            | sed -n 's@.*refs/tags/@@p' \
+            | grep -E "^${TAG_PREFIX}.*-rc\." \
+            | grep -v '\^{}$' \
+            | head -n1 || true)"
+          if [ -z "$RC_GIT_TAG" ]; then
+            echo "::error::No remote git tag matching ${TAG_PREFIX}*-rc.* was found."
+            exit 1
+          fi
+          echo "Observed RC git tag: ${RC_GIT_TAG}"
+
+          # 3) Manifest prerelease state is populated.
+          STATE_VERSION="$(yq eval ".${MANIFEST_KEY}.state.prerelease.version // \"\"" "$MANIFEST_FILE")"
+          STATE_BY="$(yq eval ".${MANIFEST_KEY}.state.prerelease.committed_by // \"\"" "$MANIFEST_FILE")"
+          if [ -z "$STATE_VERSION" ] || [ "$STATE_VERSION" = "null" ]; then
+            echo "::error::ci.state.prerelease.version is empty after orchestrate."
+            exit 1
+          fi
+          if [ -z "$STATE_BY" ] || [ "$STATE_BY" = "null" ]; then
+            echo "::error::ci.state.prerelease.committed_by is empty after orchestrate."
+            exit 1
+          fi
+          echo "Observed prerelease state: version=${STATE_VERSION} committed_by=${STATE_BY}"
+
+          # 4) No deploy job ran. The no-env topology declares no environments,
+          #    so the orchestrate run must contain no per-environment deploy job.
+          #    Enumerate the run's jobs and assert none is named like a deploy
+          #    lane (cascade names deploy jobs "deploy-<env>" / "Deploy <env>").
+          JOB_NAMES="$(gh run view "$ORCHESTRATE_RUN_ID" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json jobs \
+            --jq '.jobs[].name' 2>/dev/null || true)"
+          echo "Orchestrate run ${ORCHESTRATE_RUN_ID} jobs:"
+          printf '%s\n' "$JOB_NAMES"
+          DEPLOY_JOBS="$(printf '%s\n' "$JOB_NAMES" | grep -iE 'deploy' || true)"
+          if [ -n "$DEPLOY_JOBS" ]; then
+            echo "::error::no-env orchestrate run unexpectedly contained a deploy job:"
+            printf '%s\n' "$DEPLOY_JOBS"
+            exit 1
+          fi
+          echo "Confirmed: no deploy job ran in the no-env orchestrate run."
+
+          {
+            echo "stage1_release=${RC_RELEASE}"
+            echo "stage1_tag=${RC_GIT_TAG}"
+            echo "stage1_version=${STATE_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Stage 1 PASS: RC draft '${RC_RELEASE}' minted, tag '${RC_GIT_TAG}' present, state version '${STATE_VERSION}', no deploy job ran."
+
+      - name: Write run summary
+        if: always()
+        env:
+          STAGE1_RELEASE: ${{ steps.stage1.outputs.stage1_release }}
+          STAGE1_TAG: ${{ steps.stage1.outputs.stage1_tag }}
+          STAGE1_VERSION: ${{ steps.stage1.outputs.stage1_version }}
+        run: |
+          {
+            echo "## Scenario Suite"
+            echo ""
+            echo "| Stage | Release stage | GitHub release | Tag |"
+            echo "|-------|---------------|----------------|-----|"
+            echo "| 1 | RC draft / prerelease (no deploy) | ${STAGE1_RELEASE:-n/a} | ${STAGE1_TAG:-n/a} |"
+            echo ""
+            if [ -n "${STAGE1_RELEASE:-}" ]; then
+              echo "**Overall: PASS** - no-env orchestrate minted ${STAGE1_VERSION:-?} as ${STAGE1_RELEASE} with no deploy lane."
+            else
+              echo "**Overall: see step logs for the failing assertion.**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------
+  # Reconcile gate: structural coverage backstop. The scenario job's own
+  # asserts above still gate the orchestrate run it waits on; this job is
+  # additive. It enumerates EVERY run this repo produced since window-start
+  # (captured before the first merge) and fails if any is unaccounted for in
+  # the ledger the register-run step uploaded - an unregistered non-success
+  # run, or a registered run that concluded other than its expected
+  # conclusion. That turns any fire-and-forget run the suite forgot to gate
+  # into a hard red.
+  reconcile:
+    name: Reconcile scenario-window runs
+    needs: [scenario]
+    if: always()
+    uses: stablekernel/cascade/.github/workflows/fleet-reconcile.yaml@main
+    permissions:
+      contents: read
+      actions: read
+    with:
+      window-start: ${{ needs.scenario.outputs.window-start }}
+      # Artifact mode: the register-run step uploaded a per-job ledger under
+      # the default cascade-run-ledger-* name; reconcile globs and merges them.
+      cascade-ref: main

@@ -46,7 +46,7 @@ jobs:
       MANIFEST_KEY: ci
       TAG_PREFIX: rel-
       BOT_NAME: 'github-actions[bot]'
-      BOT_EMAIL: 'github-actions[bot]@users.noreply.github.com'
+      BOT_EMAIL: '41898282+github-actions[bot]@users.noreply.github.com'
     steps:
       # The reconcile window opens here, before the first dispatch or merge.
       # Every run the suite goes on to cause lands at or after this timestamp,
@@ -118,8 +118,8 @@ jobs:
           echo "Reset complete."
 
       # ------------------------------------------------------------------
-      # Stage 1 - FIRE ORCHESTRATE: open a PR with a src/ change, squash-merge
-      # it with the PAT so the merge commit carries a feat: subject, which
+      # Stage 1 - FIRE ORCHESTRATE: open a PR with a src/ change, rebase-merge
+      # it so the branch commit lands on main carrying a feat: subject, which
       # matches the orchestrate path filter and triggers a version bump.
       # ------------------------------------------------------------------
       - name: Open and merge src-change PR to fire orchestrate
@@ -128,8 +128,8 @@ jobs:
           GH_TOKEN: ${{ secrets.CASCADE_STATE_TOKEN }}
         run: |
           set -euo pipefail
-          git config user.name  "scenario-suite"
-          git config user.email "scenario-suite@users.noreply.github.com"
+          git config user.name  "$BOT_NAME"
+          git config user.email "$BOT_EMAIL"
 
           # Unique branch so re-runs never collide.
           STAMP="$(date -u +%Y%m%d%H%M%S)-${GITHUB_RUN_ID}"
@@ -142,25 +142,25 @@ jobs:
           printf 'scenario run %s\n' "$STAMP" > src/scenario.txt
           git add src/scenario.txt
 
-          # Branch commit message is cosmetic under squash; PR title carries
-          # the conventional type and becomes the trunk commit subject.
+          # The branch commit message carries the conventional type and, under
+          # rebase, is preserved as the trunk commit subject.
           git commit --no-gpg-sign -m "feat: exercise no-env orchestration ${STAMP}"
           git push origin "$BRANCH"
 
-          # Open PR and squash-merge with the PAT so the push event is
-          # PAT-authored and orchestrate fires.
+          # Open PR and rebase-merge so the branch commit lands on main and the
+          # push event fires orchestrate.
           gh pr create \
             --base main \
             --head "$BRANCH" \
             --title "feat: exercise no-env orchestration ${STAMP}" \
             --body "Automated scenario run; drives orchestrate on merge."
-          gh pr merge "$BRANCH" --squash --delete-branch
+          gh pr merge "$BRANCH" --rebase --delete-branch
 
           # Capture the exact merge SHA on trunk - used to key the wait loop.
           git fetch origin main --quiet
           MERGE_SHA="$(git rev-parse origin/main)"
           echo "merge_sha=${MERGE_SHA}" >> "$GITHUB_OUTPUT"
-          echo "Squash-merged ${BRANCH} -> main at ${MERGE_SHA}."
+          echo "Rebase-merged ${BRANCH} -> main at ${MERGE_SHA}."
 
       - name: Wait for orchestrate run to complete
         id: orchestrate_wait

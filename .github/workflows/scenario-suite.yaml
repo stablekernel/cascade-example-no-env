@@ -17,6 +17,14 @@ on:
         description: 'Max minutes to wait for the orchestrate run to mint an RC'
         type: string
         default: '8'
+      cascade_version:
+        description: 'cascade rc tag to self-repin to (e.g. v1.2.0-rc.1). Empty runs committed defaults.'
+        required: false
+        default: ''
+      cascade_version_sha:
+        description: 'Peeled commit SHA paired with cascade_version. Empty runs committed defaults.'
+        required: false
+        default: ''
   schedule:
     # Daily smoke run at 06:30 UTC.
     - cron: '30 6 * * *'
@@ -101,16 +109,31 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.CASCADE_STATE_TOKEN }}
 
+      - name: Log cascade version mode
+        run: |
+          if [ -n "${{ inputs.cascade_version }}" ]; then
+            echo "Running against dispatched rc: ${{ inputs.cascade_version }} (sha ${{ inputs.cascade_version_sha }})"
+          else
+            echo "Running against committed defaults (no rc dispatched)"
+          fi
+
       - name: Setup CLI
         uses: stablekernel/cascade/.github/actions/setup-cli@v0.8.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          version: v0.8.0
+          version: ${{ inputs.cascade_version || 'v0.8.0' }}
 
       - name: Configure git identity
         run: |
           git config user.name "$BOT_NAME"
           git config user.email "$BOT_EMAIL"
+
+      - name: Self-repin manifest to the dispatched rc
+        uses: stablekernel/cascade/.github/actions/fleet-repin@main
+        with:
+          cascade_version: ${{ inputs.cascade_version }}
+          cascade_version_sha: ${{ inputs.cascade_version_sha }}
+          token: ${{ secrets.CASCADE_STATE_TOKEN }}
 
       # ------------------------------------------------------------------
       # Stage 0 - RESET: wipe every release, tag, and state entry so the run

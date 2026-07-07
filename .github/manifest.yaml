@@ -4,8 +4,8 @@ ci:
     trunk_branch: main
     triggers:
       - src/**
-    cli_version: v0.10.0-rc.0
-    cli_version_sha: d61d641f4feb12192d9d8eb75b34c414df7da798
+    cli_version: v0.11.0-rc.0
+    cli_version_sha: 2cd506a7b3068f8a8fa6475458593129992e6f3d
     tag_prefix: rel-
     state_token: ${{ secrets.CASCADE_STATE_TOKEN }}
     manifest_file: .github/manifest.yaml

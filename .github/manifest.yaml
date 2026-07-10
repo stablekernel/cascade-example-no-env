@@ -4,7 +4,7 @@ ci:
     trunk_branch: main
     triggers:
       - src/**
-    cli_version: v0.14.0-dryrun.51
+    cli_version: v0.14.0-rc.0
     cli_version_sha: f904ea561ac0ba556b251bca7ea8f54f492c7a54
     tag_prefix: rel-
     state_token: ${{ secrets.CASCADE_STATE_TOKEN }}

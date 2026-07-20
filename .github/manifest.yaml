@@ -4,7 +4,7 @@ ci:
     trunk_branch: main
     triggers:
       - src/**
-    cli_version: v0.16.6-dryrun.80
+    cli_version: v0.16.6-rc.0
     cli_version_sha: c17b74089833ecc7b24f2babee7c17f6861b1d43
     tag_grammar:
       prefix: rel-
